@@ -1,332 +1,459 @@
 package tunnel
 
 import (
-	"encoding/base64"
-	"encoding/binary"
+	"bufio"
+	"context"
 	"fmt"
-	"io"
-	"math/rand"
 	"net"
-	"os"
-	"os/exec"
+	"net/netip"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
-	"crypto/sha256"
-
-	"golang.org/x/crypto/chacha20poly1305"
-	"golang.org/x/crypto/curve25519"
-	"golang.org/x/crypto/hkdf"
+	"github.com/Baba01hacker666/cerberus/internal/isolation"
+	"golang.zx2c4.com/wireguard/device"
+	"golang.zx2c4.com/wireguard/tun"
 )
-
-const (
-	MTU       = 1420
-	NonceSize = 24
-	IndexSize = 4
-)
-
-// GenerateKeyPair returns base64 X25519 private/public keys.
-func GenerateKeyPair() (string, string, error) {
-	priv := make([]byte, 32)
-	if err := readRand(priv); err != nil {
-		return "", "", err
-	}
-	// clamp
-	priv[0] &= 248
-	priv[31] &= 127
-	priv[31] |= 64
-	pub, err := curve25519.X25519(priv, curve25519.Basepoint)
-	if err != nil {
-		return "", "", err
-	}
-	return base64.StdEncoding.EncodeToString(priv), base64.StdEncoding.EncodeToString(pub), nil
-}
-
-func readRand(b []byte) error {
-	f, err := os.Open("/dev/urandom")
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	_, err = io.ReadFull(f, b)
-	return err
-}
 
 type PeerConfig struct {
-	Index     uint32
-	PublicKey string
-	Endpoint  string
-	MeshIP    string
+	Index        uint32
+	PublicKey    string
+	PresharedKey string
+	Endpoint     string
+	MeshIP       string
+	AllowedIPs   []string
+	Keepalive    int
 }
 
 type TunnelConfig struct {
-	Name       string
-	PrivateKey string
-	PublicKey  string
-	MeshIP     string // with prefix
-	ListenPort int
+	Name          string
+	PrivateKey    string
+	PublicKey     string
+	MeshIP        string // e.g. "10.77.0.1/16" or "10.77.0.2/16"
+	ListenPort    int    // 0 = auto-pick free UDP port
+	MTU           int
+	IsServer      bool // enables userspace hub-router mesh forwarding between peers
+	UserspaceOnly bool // skips kernel /dev/net/tun even when running as root
+	ForceTCP      bool // disables raw UDP so WireGuard tunnels strictly over single-port TCP
+	VerboseLogs   bool
+	Policy        *isolation.PolicyEngine
 }
 
-type peerState struct {
-	Index     uint32
-	PublicKey string
-	Endpoint  string
-	MeshIP    string
-	SharedKey [32]byte
-	hasKey    bool
+// PeerRuntimeStats reports real live cryptographic session metrics from wireguard-go.
+type PeerRuntimeStats struct {
+	PublicKey           string `json:"public_key"`
+	Endpoint            string `json:"endpoint"`
+	TxBytes             uint64 `json:"tx_bytes"`
+	RxBytes             uint64 `json:"rx_bytes"`
+	LastHandshakeTimeSec int64 `json:"last_handshake_sec"`
+}
+
+type appliedPeer struct {
+	pubHex     string
+	pskHex     string
+	endpoint   string
+	allowedIPs []string
+	keepalive  int
 }
 
 type Tunnel struct {
-	cfg    TunnelConfig
-	mu     sync.RWMutex
-	peers  map[string]*peerState // by mesh ip
-	byIdx  map[uint32]*peerState
-	nextIdx uint32
+	cfg TunnelConfig
 
-	conn *net.UDPConn
-	tun  *os.File
-	stop chan struct{}
-	running bool
+	mu          sync.RWMutex
+	reconcileMu sync.Mutex
 
-	counter uint64
+	bind       *HybridBind
+	router     *RouterTUN
+	wgDev      *device.Device
+	realIfName string
+	running    bool
+	stopOnce   sync.Once
+	stopCh     chan struct{}
+
+	activePeers map[string]appliedPeer // keyed by hex public key
+	lastDesired []PeerConfig
 }
 
 func New(cfg TunnelConfig) *Tunnel {
 	if cfg.Name == "" {
 		cfg.Name = "cerberus0"
 	}
-	if cfg.ListenPort == 0 {
-		cfg.ListenPort = 51820
+	if cfg.MTU <= 0 {
+		cfg.MTU = MTU
+	}
+	b := NewHybridBind()
+	if cfg.ForceTCP {
+		b.DisableUDP(true)
 	}
 	return &Tunnel{
-		cfg:    cfg,
-		peers:  map[string]*peerState{},
-		byIdx:  map[uint32]*peerState{},
-		stop:   make(chan struct{}),
+		cfg:         cfg,
+		bind:        b,
+		stopCh:      make(chan struct{}),
+		activePeers: make(map[string]appliedPeer),
 	}
+}
+
+func (t *Tunnel) Bind() *HybridBind {
+	return t.bind
+}
+
+func (t *Tunnel) Router() *RouterTUN {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.router
+}
+
+func (t *Tunnel) InterfaceName() string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.realIfName != "" {
+		return t.realIfName
+	}
+	return t.cfg.Name
+}
+
+func (t *Tunnel) ActualUDPPort() int {
+	return t.bind.ActualUDPPort()
+}
+
+func (t *Tunnel) HasOSInterface() bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.router != nil && t.router.HasOSDevice()
 }
 
 func (t *Tunnel) Available() bool {
-	if _, err := os.Stat("/dev/net/tun"); err != nil {
-		return false
-	}
-	if _, err := exec.LookPath("ip"); err != nil {
-		return false
-	}
-	return true
+	return Available()
 }
 
-func (t *Tunnel) Start(ctx interface{ Done() <-chan struct{} }) error {
+// Available reports whether kernel OS TUN creation is available on this host.
+// Note: Even when Available() returns false (e.g. non-root containers or unit tests),
+// Tunnel.Start() still works 100% in userspace WireGuard mode!
+func Available() bool {
+	return osTunnelSupported()
+}
+
+func parseLocalMeshAddr(meshIP string) netip.Addr {
+	s := strings.TrimSpace(meshIP)
+	if s == "" {
+		return netip.Addr{}
+	}
+	if pfx, err := netip.ParsePrefix(s); err == nil {
+		return pfx.Addr().Unmap()
+	}
+	if ip, _, err := net.ParseCIDR(s); err == nil {
+		if a, ok := netip.AddrFromSlice(ip); ok {
+			return a.Unmap()
+		}
+	}
+	if a, err := netip.ParseAddr(s); err == nil {
+		return a.Unmap()
+	}
+	return netip.Addr{}
+}
+
+func (t *Tunnel) Start(ctx context.Context) error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if t.running {
+		t.mu.Unlock()
 		return nil
 	}
-	if err := t.setupTUN(); err != nil {
-		return fmt.Errorf("tun setup: %w", err)
-	}
-	addr := fmt.Sprintf("0.0.0.0:%d", t.cfg.ListenPort)
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+
+	privHex, err := KeyToHex(t.cfg.PrivateKey)
 	if err != nil {
-		return err
+		t.mu.Unlock()
+		return fmt.Errorf("invalid tunnel private key: %w", err)
 	}
-	conn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return err
+
+	var osDev tun.Device
+	ifName := t.cfg.Name
+	if !t.cfg.UserspaceOnly && osTunnelSupported() {
+		dev, realName, err := createAndConfigureOSTUN(t.cfg.Name, t.cfg.MeshIP, t.cfg.MTU)
+		if err == nil {
+			osDev = dev
+			ifName = realName
+		}
+		// If OS TUN fails (e.g. unprivileged Docker container without CAP_NET_ADMIN), seamlessly continue in userspace mode!
 	}
-	t.conn = conn
+
+	localAddr := parseLocalMeshAddr(t.cfg.MeshIP)
+	router := NewRouterTUN(RouterTUNOptions{
+		Name:     ifName,
+		MTU:      t.cfg.MTU,
+		Inner:    osDev,
+		LocalIP:  localAddr,
+		IsRouter: t.cfg.IsServer,
+		Policy:   t.cfg.Policy,
+	})
+
+	logLevel := device.LogLevelSilent
+	if t.cfg.VerboseLogs {
+		logLevel = device.LogLevelVerbose
+	}
+	logger := device.NewLogger(logLevel, fmt.Sprintf("cerberus(%s) ", ifName))
+	wgDev := device.NewDevice(router, t.bind, logger)
+
+	var ipcCfg strings.Builder
+	ipcCfg.WriteString(fmt.Sprintf("private_key=%s\n", privHex))
+	ipcCfg.WriteString(fmt.Sprintf("listen_port=%d\n", t.cfg.ListenPort))
+	if err := wgDev.IpcSet(ipcCfg.String()); err != nil {
+		wgDev.Close()
+		_ = router.Close()
+		t.bind.Shutdown()
+		t.mu.Unlock()
+		return fmt.Errorf("wireguard ipc init: %w", err)
+	}
+	if err := wgDev.Up(); err != nil {
+		wgDev.Close()
+		_ = router.Close()
+		t.bind.Shutdown()
+		t.mu.Unlock()
+		return fmt.Errorf("wireguard device up: %w", err)
+	}
+
+	t.router = router
+	t.wgDev = wgDev
+	t.realIfName = ifName
 	t.running = true
-	go t.runTUN()
-	go t.runUDP()
+	pending := append([]PeerConfig(nil), t.lastDesired...)
+	t.mu.Unlock()
+
+	if len(pending) > 0 {
+		t.UpdatePeers(pending)
+	}
+
 	go func() {
 		select {
 		case <-ctx.Done():
 			t.Stop()
-		case <-t.stop:
+		case <-t.stopCh:
 		}
 	}()
 	return nil
 }
 
 func (t *Tunnel) Stop() {
-	close(t.stop)
-	if t.conn != nil {
-		_ = t.conn.Close()
-	}
-	if t.tun != nil {
-		_ = t.tun.Close()
-	}
+	t.stopOnce.Do(func() {
+		close(t.stopCh)
+		t.mu.Lock()
+		t.running = false
+		wgDev := t.wgDev
+		router := t.router
+		t.wgDev = nil
+		t.mu.Unlock()
+
+		if wgDev != nil {
+			wgDev.Close()
+		}
+		if router != nil {
+			_ = router.Close()
+		}
+		t.bind.Shutdown()
+	})
 }
 
+// UpdatePeers incrementally reconciles the WireGuard peer configuration without resetting
+// existing sessions, active Noise keys, or learned NAT roaming endpoints!
 func (t *Tunnel) UpdatePeers(peers []PeerConfig) {
+	t.reconcileMu.Lock()
+	defer t.reconcileMu.Unlock()
+
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	// rebuild
-	t.peers = map[string]*peerState{}
-	t.byIdx = map[uint32]*peerState{}
+	cpDesired := make([]PeerConfig, len(peers))
+	for i, p := range peers {
+		cpDesired[i] = p
+		if p.AllowedIPs != nil {
+			cpDesired[i].AllowedIPs = append([]string(nil), p.AllowedIPs...)
+		}
+	}
+	t.lastDesired = cpDesired
+	wgDev := t.wgDev
+	router := t.router
+	running := t.running
+	selfPub := t.cfg.PublicKey
+	t.mu.Unlock()
+
+	if !running || wgDev == nil {
+		return
+	}
+
+	// Update RouterTUN peer IP set first so any hairpinned mesh traffic routes immediately
+	meshIPs := make([]string, 0, len(peers))
+	desiredMap := make(map[string]appliedPeer, len(peers))
+
 	for _, pc := range peers {
-		if pc.PublicKey == "" || pc.MeshIP == "" {
+		if pc.PublicKey == "" || pc.PublicKey == selfPub {
 			continue
 		}
-		idx := pc.Index
-		if idx == 0 {
-			t.nextIdx++
-			idx = t.nextIdx
-		}
-		ps := &peerState{
-			Index:     idx,
-			PublicKey: pc.PublicKey,
-			Endpoint:  pc.Endpoint,
-			MeshIP:    pc.MeshIP,
-		}
-		// derive shared key
-		key, err := deriveShared(t.cfg.PrivateKey, pc.PublicKey)
-		if err == nil {
-			ps.SharedKey = key
-			ps.hasKey = true
-		}
-		t.peers[pc.MeshIP] = ps
-		t.byIdx[idx] = ps
-	}
-}
-
-func (t *Tunnel) runTUN() {
-	buf := make([]byte, 65535)
-	for {
-		n, err := t.tun.Read(buf)
-		if err != nil {
-			return
-		}
-		if n == 0 {
-			continue
-		}
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
-		dst := dstIP(pkt)
-		if dst == "" {
-			continue
-		}
-		t.mu.RLock()
-		ps := t.peers[dst]
-		t.mu.RUnlock()
-		if ps == nil || !ps.hasKey || ps.Endpoint == "" {
-			continue
-		}
-		t.sendPacket(ps, pkt)
-	}
-}
-
-func (t *Tunnel) sendPacket(ps *peerState, pkt []byte) {
-	nonce := make([]byte, NonceSize)
-	_, _ = rand.Read(nonce)
-	aead, err := chacha20poly1305.NewX(ps.SharedKey[:])
-	if err != nil {
-		return
-	}
-	ct := aead.Seal(nil, nonce, pkt, nil)
-	buf := make([]byte, IndexSize+NonceSize+len(ct))
-	binary.BigEndian.PutUint32(buf[:IndexSize], ps.Index)
-	copy(buf[IndexSize:], nonce)
-	copy(buf[IndexSize+NonceSize:], ct)
-	addr, err := net.ResolveUDPAddr("udp", ps.Endpoint)
-	if err != nil {
-		return
-	}
-	_, _ = t.conn.WriteToUDP(buf, addr)
-}
-
-func (t *Tunnel) runUDP() {
-	buf := make([]byte, 65535)
-	for {
-		n, _, err := t.conn.ReadFromUDP(buf)
-		if err != nil {
-			return
-		}
-		if n < IndexSize+NonceSize {
-			continue
-		}
-		idx := binary.BigEndian.Uint32(buf[:IndexSize])
-		t.mu.RLock()
-		ps := t.byIdx[idx]
-		t.mu.RUnlock()
-		if ps == nil || !ps.hasKey {
-			continue
-		}
-		nonce := buf[IndexSize : IndexSize+NonceSize]
-		ct := buf[IndexSize+NonceSize : n]
-		aead, err := chacha20poly1305.NewX(ps.SharedKey[:])
+		pubHex, err := KeyToHex(pc.PublicKey)
 		if err != nil {
 			continue
 		}
-		pt, err := aead.Open(nil, nonce, ct, nil)
-		if err != nil {
+		var pskHex string
+		if pc.PresharedKey != "" {
+			if h, err := KeyToHex(pc.PresharedKey); err == nil {
+				pskHex = h
+			}
+		}
+		var allowed []string
+		if len(pc.AllowedIPs) > 0 {
+			allowed = append(allowed, pc.AllowedIPs...)
+		} else if pc.MeshIP != "" {
+			if strings.Contains(pc.MeshIP, "/") {
+				allowed = []string{pc.MeshIP}
+			} else {
+				allowed = []string{pc.MeshIP + "/32"}
+			}
+		}
+		if len(allowed) == 0 {
 			continue
 		}
-		_, _ = t.tun.Write(pt)
+		sort.Strings(allowed)
+		if pc.MeshIP != "" {
+			meshIPs = append(meshIPs, strings.Split(pc.MeshIP, "/")[0])
+		}
+		desiredMap[pubHex] = appliedPeer{
+			pubHex:     pubHex,
+			pskHex:     pskHex,
+			endpoint:   strings.TrimSpace(pc.Endpoint),
+			allowedIPs: allowed,
+			keepalive:  pc.Keepalive,
+		}
+	}
+	if router != nil {
+		router.SetPeerIPs(meshIPs)
+	}
+
+	var uapi strings.Builder
+
+	// 1. Remove peers that disappeared
+	for pubHex := range t.activePeers {
+		if _, keep := desiredMap[pubHex]; !keep {
+			uapi.WriteString(fmt.Sprintf("public_key=%s\nremove=true\n", pubHex))
+			delete(t.activePeers, pubHex)
+		}
+	}
+
+	// 2. Add new peers or differentially update changed fields ONLY
+	for pubHex, next := range desiredMap {
+		prev, exists := t.activePeers[pubHex]
+		if exists && peersEqual(prev, next) {
+			continue
+		}
+		uapi.WriteString(fmt.Sprintf("public_key=%s\n", pubHex))
+		if !exists || prev.pskHex != next.pskHex {
+			if next.pskHex != "" {
+				uapi.WriteString(fmt.Sprintf("preshared_key=%s\n", next.pskHex))
+			} else if exists && prev.pskHex != "" {
+				uapi.WriteString(fmt.Sprintf("preshared_key=%064d\n", 0))
+			}
+		}
+		// CRITICAL: Only emit endpoint=... when next.endpoint is non-empty AND actually changed from
+		// the previously configured value! Otherwise we preserve WireGuard's live NAT-roamed endpoint!
+		if next.endpoint != "" && (!exists || prev.endpoint != next.endpoint) {
+			if _, err := t.bind.ParseEndpoint(next.endpoint); err == nil {
+				uapi.WriteString(fmt.Sprintf("endpoint=%s\n", next.endpoint))
+			}
+		}
+		if !exists || !slicesEqual(prev.allowedIPs, next.allowedIPs) {
+			uapi.WriteString("replace_allowed_ips=true\n")
+			for _, cidr := range next.allowedIPs {
+				uapi.WriteString(fmt.Sprintf("allowed_ip=%s\n", cidr))
+			}
+		}
+		if (!exists && next.keepalive > 0) || (exists && prev.keepalive != next.keepalive) {
+			uapi.WriteString(fmt.Sprintf("persistent_keepalive_interval=%d\n", next.keepalive))
+		}
+		t.activePeers[pubHex] = next
+	}
+
+	cmd := uapi.String()
+	if cmd != "" {
+		_ = wgDev.IpcSet(cmd)
 	}
 }
 
-func dstIP(pkt []byte) string {
-	if len(pkt) == 0 {
-		return ""
-	}
-	ver := pkt[0] >> 4
-	if ver == 4 && len(pkt) >= 20 {
-		return net.IP(pkt[16:20]).String()
-	}
-	if ver == 6 && len(pkt) >= 40 {
-		return net.IP(pkt[24:40]).String()
-	}
-	return ""
+func peersEqual(a, b appliedPeer) bool {
+	return a.pskHex == b.pskHex &&
+		a.endpoint == b.endpoint &&
+		a.keepalive == b.keepalive &&
+		slicesEqual(a.allowedIPs, b.allowedIPs)
 }
 
-func deriveShared(privB64, pubB64 string) ([32]byte, error) {
-	var key [32]byte
-	priv, err := base64.StdEncoding.DecodeString(privB64)
-	if err != nil {
-		return key, err
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
 	}
-	pub, err := base64.StdEncoding.DecodeString(pubB64)
-	if err != nil {
-		return key, err
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
 	}
-	var privArr, pubArr [32]byte
-	copy(privArr[:], priv)
-	copy(pubArr[:], pub)
-	shared, err := curve25519.X25519(privArr[:], pubArr[:])
-	if err != nil {
-		return key, err
-	}
-	hk := hkdf.New(sha256.New, shared, nil, []byte("cerberus-v1"))
-	if _, err := io.ReadFull(hk, key[:]); err != nil {
-		return key, err
-	}
-	return key, nil
+	return true
 }
 
-func MeshIPWithPrefix(ip string, cidr string) string {
-	// reuse logic from mesh package? avoid import cycle; simple
-	if ip == "" {
-		return ""
+// Ping sends an encrypted ICMP Echo Request over the active WireGuard tunnel to dstIP.
+func (t *Tunnel) Ping(ctx context.Context, dstIP string, timeout time.Duration) (time.Duration, error) {
+	r := t.Router()
+	if r == nil {
+		return 0, fmt.Errorf("tunnel not running")
 	}
-	// if already has slash
-	if len(ip) > 0 {
-		for i := 0; i < len(ip); i++ {
-			if ip[i] == '/' {
-				return ip
+	return r.Ping(ctx, dstIP, timeout)
+}
+
+// PeerStats queries wireguard-go's live UAPI telemetry (tx_bytes, rx_bytes, roamed endpoint, handshake timestamp).
+func (t *Tunnel) PeerStats() ([]PeerRuntimeStats, error) {
+	t.mu.RLock()
+	wgDev := t.wgDev
+	t.mu.RUnlock()
+	if wgDev == nil {
+		return nil, nil
+	}
+	raw, err := wgDev.IpcGet()
+	if err != nil {
+		return nil, err
+	}
+	var out []PeerRuntimeStats
+	var cur *PeerRuntimeStats
+	sc := bufio.NewScanner(strings.NewReader(raw))
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "public_key":
+			if cur != nil {
+				out = append(out, *cur)
+			}
+			b64, err := HexToKey(v)
+			if err != nil {
+				b64 = v
+			}
+			cur = &PeerRuntimeStats{PublicKey: b64}
+		case "endpoint":
+			if cur != nil {
+				cur.Endpoint = v
+			}
+		case "tx_bytes":
+			if cur != nil {
+				cur.TxBytes, _ = strconv.ParseUint(v, 10, 64)
+			}
+		case "rx_bytes":
+			if cur != nil {
+				cur.RxBytes, _ = strconv.ParseUint(v, 10, 64)
+			}
+		case "last_handshake_time_sec":
+			if cur != nil {
+				cur.LastHandshakeTimeSec, _ = strconv.ParseInt(v, 10, 64)
 			}
 		}
 	}
-	// default /32
-	return ip + "/32"
-}
-
-// Available reports whether the tunnel can run on this host.
-func Available() bool {
-	if _, err := os.Stat("/dev/net/tun"); err != nil {
-		return false
+	if cur != nil {
+		out = append(out, *cur)
 	}
-	if _, err := exec.LookPath("ip"); err != nil {
-		return false
-	}
-	return true
+	return out, nil
 }

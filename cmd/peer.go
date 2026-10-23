@@ -18,8 +18,16 @@ var peerListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List peers",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		st := store.New(dataDir())
-		for _, p := range st.List() {
+		c := mustCfg()
+		cl := control.NewClient(localServerURL(c))
+		cl.AuthToken = c.AuthToken
+		var peers []store.Peer
+		if live, err := cl.ListPeers(); err == nil {
+			peers = live
+		} else {
+			peers = store.New(dataDir()).List()
+		}
+		for _, p := range peers {
 			fmt.Printf("%-16s %-20s %-16s %s\n", p.ID, p.Name, p.MeshIP, p.PublicKey)
 		}
 		return nil
@@ -28,19 +36,17 @@ var peerListCmd = &cobra.Command{
 
 var peerAddCmd = &cobra.Command{
 	Use:   "add [remote-url]",
-	Short: "Register this node with a remote peer or add a peer manually",
+	Short: "Register this node with a remote server or add a peer manually",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c := mustCfg()
-		st := store.New(dataDir())
-		if len(args) > 0 && strings.HasPrefix(args[0], "http") {
-			// register with remote
-			client := control.NewClient(args[0])
-			info, err := client.Info()
-			if err != nil {
-				return err
+		if len(args) > 0 {
+			remote := args[0]
+			if !strings.HasPrefix(remote, "http://") && !strings.HasPrefix(remote, "https://") {
+				remote = "http://" + remote
 			}
-			// send our info
-			peer, err := client.Register(control.RegisterReq{
+			cl := control.NewClient(remote)
+			cl.AuthToken = c.AuthToken
+			jr, err := cl.Join(control.RegisterReq{
 				Name:      c.NodeName,
 				PublicKey: c.PublicKey,
 				Endpoint:  c.Endpoint,
@@ -49,31 +55,59 @@ var peerAddCmd = &cobra.Command{
 			if err != nil {
 				return err
 			}
-			_ = st.Add(*peer)
+			st := store.New(dataDir())
+			_ = st.Add(store.Peer{
+				ID:         "srv-" + jr.Server.NodeName,
+				Name:       jr.Server.NodeName,
+				PublicKey:  jr.Server.PublicKey,
+				Endpoint:   jr.Server.Endpoint,
+				MeshIP:     jr.Server.MeshIP,
+				AllowedIPs: []string{jr.Server.MeshCIDR},
+			})
 			_ = st.Save()
-			fmt.Println("registered with", info.NodeName, "-> mesh ip", peer.MeshIP)
+			fmt.Println("registered with", jr.Server.NodeName, "-> assigned mesh ip", jr.Peer.MeshIP)
 			return nil
 		}
-		// manual add via flags
+
 		pub, _ := cmd.Flags().GetString("pubkey")
 		ep, _ := cmd.Flags().GetString("endpoint")
 		ip, _ := cmd.Flags().GetString("ip")
 		name, _ := cmd.Flags().GetString("name")
 		if pub == "" {
-			return fmt.Errorf("--pubkey required")
+			return fmt.Errorf("--pubkey required when no remote URL is provided")
 		}
+
+		// Try live daemon first so WireGuard reconciles immediately!
+		cl := control.NewClient(localServerURL(c))
+		cl.AuthToken = c.AuthToken
+		if created, err := cl.Register(control.RegisterReq{
+			Name:      name,
+			PublicKey: pub,
+			Endpoint:  ep,
+			MeshIP:    ip,
+		}); err == nil {
+			fmt.Println("added peer", created.ID, "->", created.MeshIP)
+			return nil
+		}
+
+		st := store.New(dataDir())
 		id := name
-		if id == "" {
+		if id == "" && len(pub) >= 8 {
 			id = pub[:8]
+		} else if id == "" {
+			id = "peer"
 		}
-		p := store.Peer{ID: id, Name: name, PublicKey: pub, Endpoint: ep, MeshIP: ip, AllowedIPs: []string{ip + "/32"}}
-		if ip == "" {
-			p.AllowedIPs = []string{}
+		var allowed []string
+		if ip != "" {
+			allowed = []string{ip + "/32"}
 		}
+		p := store.Peer{ID: id, Name: name, PublicKey: pub, Endpoint: ep, MeshIP: ip, AllowedIPs: allowed}
 		if err := st.Add(p); err != nil {
 			return err
 		}
-		_ = st.Save()
+		if err := st.Save(); err != nil {
+			return err
+		}
 		fmt.Println("added peer", id)
 		return nil
 	},
@@ -84,9 +118,18 @@ var peerRemoveCmd = &cobra.Command{
 	Short: "Remove a peer",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		c := mustCfg()
+		cl := control.NewClient(localServerURL(c))
+		cl.AuthToken = c.AuthToken
+		if err := cl.DeletePeer(args[0]); err == nil {
+			fmt.Println("removed", args[0])
+			return nil
+		}
 		st := store.New(dataDir())
 		st.Remove(args[0])
-		_ = st.Save()
+		if err := st.Save(); err != nil {
+			return err
+		}
 		fmt.Println("removed", args[0])
 		return nil
 	},

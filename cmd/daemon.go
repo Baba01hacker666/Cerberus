@@ -16,7 +16,7 @@ import (
 	"github.com/Baba01hacker666/cerberus/internal/isolation"
 	"github.com/Baba01hacker666/cerberus/internal/mesh"
 	"github.com/Baba01hacker666/cerberus/internal/store"
-	"github.com/Baba01hacker666/cerberus/internal/wireguard"
+	"github.com/Baba01hacker666/cerberus/internal/tunnel"
 	"github.com/spf13/cobra"
 )
 
@@ -27,7 +27,7 @@ var daemonCmd = &cobra.Command{
 		c := mustCfg()
 		// ensure keys
 		if c.PrivateKey == "" {
-			priv, pub, err := wireguard.GenerateKeyPair()
+			priv, pub, err := tunnel.GenerateKeyPair()
 			if err != nil {
 				return err
 			}
@@ -46,6 +46,20 @@ var daemonCmd = &cobra.Command{
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
+		// tunnel instance
+		tun := tunnel.New(tunnel.TunnelConfig{
+			Name:       c.Interface,
+			PrivateKey: c.PrivateKey,
+			PublicKey:  c.PublicKey,
+			MeshIP:     mesh.MeshIPWithPrefix(firstIP(c), c.MeshCIDR),
+			ListenPort: 51820,
+		})
+		if tunnel.Available() {
+			if err := tun.Start(ctx); err != nil {
+				fmt.Fprintln(os.Stderr, "tunnel start:", err)
+			}
+		}
+
 		// docker auto-add loop
 		if c.Docker.AutoAdd {
 			go autoAddLoop(ctx, c, st)
@@ -55,7 +69,7 @@ var daemonCmd = &cobra.Command{
 		go syncLoop(ctx, c, st)
 
 		// rebuild + apply loop
-		go reconcileLoop(ctx, c, st, iso)
+		go reconcileLoop(ctx, c, st, iso, tun)
 
 		// control server
 		addr := c.ListenAddr
@@ -218,8 +232,8 @@ func syncLoop(ctx context.Context, c *config.Config, st *store.Store) {
 	}
 }
 
-func reconcileLoop(ctx context.Context, c *config.Config, st *store.Store, iso *isolation.Manager) {
-	reconcile(c, st, iso)
+func reconcileLoop(ctx context.Context, c *config.Config, st *store.Store, iso *isolation.Manager, tun *tunnel.Tunnel) {
+	reconcile(c, st, iso, tun)
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -227,36 +241,30 @@ func reconcileLoop(ctx context.Context, c *config.Config, st *store.Store, iso *
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			reconcile(c, st, iso)
+			reconcile(c, st, iso, tun)
 		}
 	}
 }
 
-func reconcile(c *config.Config, st *store.Store, iso *isolation.Manager) {
+func reconcile(c *config.Config, st *store.Store, iso *isolation.Manager, tun *tunnel.Tunnel) {
 	peers := st.List()
-	// build wireguard config
-	var wgPeers []wireguard.PeerConfig
+	// build tunnel peers
+	var tunPeers []tunnel.PeerConfig
+	idx := uint32(0)
 	for _, p := range peers {
 		if p.PublicKey == "" {
 			continue
 		}
-		wgPeers = append(wgPeers, wireguard.PeerConfig{
-			PublicKey:  p.PublicKey,
-			Endpoint:   p.Endpoint,
-			AllowedIPs: p.AllowedIPs,
+		idx++
+		tunPeers = append(tunPeers, tunnel.PeerConfig{
+			Index:     idx,
+			PublicKey: p.PublicKey,
+			Endpoint:  p.Endpoint,
+			MeshIP:    p.MeshIP,
 		})
 	}
-	cfg := wireguard.InterfaceConfig{
-		Name:       c.Interface,
-		PrivateKey: c.PrivateKey,
-		Address:    mesh.MeshIPWithPrefix(firstIP(c), c.MeshCIDR),
-		ListenPort: 51820,
-		Peers:      wgPeers,
-	}
-	path := c.DataDir + "/wg.conf"
-	_ = wireguard.WriteConfig(path, cfg)
-	if wireguard.Available() {
-		_ = wireguard.Apply(c.Interface, path)
+	if tun != nil {
+		tun.UpdatePeers(tunPeers)
 	}
 
 	// isolation

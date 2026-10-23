@@ -5,7 +5,7 @@ import (
 	"net"
 
 	"github.com/Baba01hacker666/cerberus/internal/config"
-	"github.com/Baba01hacker666/cerberus/internal/wireguard"
+	"github.com/Baba01hacker666/cerberus/internal/tunnel"
 	"github.com/spf13/cobra"
 )
 
@@ -15,7 +15,7 @@ var initCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		c := mustCfg()
 		if c.PrivateKey == "" {
-			priv, pub, err := wireguard.GenerateKeyPair()
+			priv, pub, err := tunnel.GenerateKeyPair()
 			if err != nil {
 				return err
 			}

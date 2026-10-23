@@ -5,7 +5,7 @@ import (
 
 	"github.com/Baba01hacker666/cerberus/internal/isolation"
 	"github.com/Baba01hacker666/cerberus/internal/store"
-	"github.com/Baba01hacker666/cerberus/internal/wireguard"
+	"github.com/Baba01hacker666/cerberus/internal/tunnel"
 	"github.com/spf13/cobra"
 )
 
@@ -21,7 +21,7 @@ var statusCmd = &cobra.Command{
 		fmt.Println("listen:", c.ListenAddr)
 		fmt.Println("public key:", c.PublicKey)
 		fmt.Println("peers:", len(st.List()))
-		fmt.Println("wireguard available:", wireguard.Available())
+		fmt.Println("tunnel available:", tunnel.Available())
 		fmt.Println("iptables available:", isolation.HasIptables())
 		return nil
 	},

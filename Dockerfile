@@ -7,7 +7,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/cerberus .
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates iptables iproute2 wireguard-tools
+RUN apk add --no-cache ca-certificates iptables iproute2
 COPY --from=build /out/cerberus /usr/local/bin/cerberus
 EXPOSE 7443 51820/udp
 ENTRYPOINT ["/usr/local/bin/cerberus"]

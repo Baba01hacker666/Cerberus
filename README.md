@@ -1,8 +1,8 @@
 # Cerberus
 
-Cerberus is a WireGuard-like mesh networking tool built for Docker containers.
+Cerberus is a WireGuard-inspired mesh networking tool built for Docker containers.
 It auto-discovers containers, assigns mesh IPs, coordinates peers over a modern
-HTTP/2 control plane, tunnels traffic with WireGuard, and can isolate containers
+HTTP/2 control plane, tunnels traffic with a custom encrypted UDP protocol (X25519 + ChaCha20-Poly1305), and can isolate containers
 from each other with firewall policies.
 
 ## One-liner install
@@ -41,7 +41,7 @@ cerberus isolate apply
 ## Container auto-add
 
 Containers labeled `cerberus.enable=true` are automatically added to the mesh.
-Optional label `cerberus.public-key=<wireguard pubkey>`.
+Optional label `cerberus.public-key=<x25519 pubkey>`.
 
 ```bash
 docker run -d --label cerberus.enable=true --label cerberus.public-key=<pub> nginx
@@ -50,7 +50,7 @@ docker run -d --label cerberus.enable=true --label cerberus.public-key=<pub> ngi
 ## Features
 
 - Auto peer discovery & registration
-- WireGuard data plane (modern Noise protocol)
+ - Custom data plane: X25519 key exchange + ChaCha20-Poly1305 over UDP (WireGuard-inspired, no wg dependency)
 - HTTP/2 JSON control plane
 - Docker container auto-add via labels
 - Mesh IP allocation from CIDR
@@ -62,13 +62,13 @@ docker run -d --label cerberus.enable=true --label cerberus.public-key=<pub> ngi
 ## Architecture
 
 ```
-+-----------+        HTTP/2        +-----------+
-| cerberus  |<------------------>| cerberus  |
-|  daemon   |   control plane     |  daemon   |
-+-----+-----+                     +-----+-----+
-      |                                 |
-      | WireGuard (UDP)                 |
-      +---------------------------------+
++-----------+        HTTP/2 (control)        +-----------+
+| cerberus  |<---------------------------->| cerberus  |
+|  daemon   |                              |  daemon   |
++-----+-----+                              +-----+-----+
+      |                                          |
+      | Encrypted UDP tunnel (X25519+ChaCha20)   |
+      +------------------------------------------+
 ```
 
 ## License

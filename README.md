@@ -8,7 +8,7 @@ from each other with firewall policies.
 ## One-liner install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/baba01hacker/cerberus/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Baba01hacker666/cerberus/main/scripts/install.sh | bash
 ```
 
 ## Build from source

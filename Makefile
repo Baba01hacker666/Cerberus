@@ -1,6 +1,6 @@
 BINARY := cerberus
 VERSION ?= 0.1.0
-LDFLAGS := -s -w -X github.com/baba01hacker/cerberus/cmd.version=$(VERSION)
+LDFLAGS := -s -w -X github.com/Baba01hacker666/cerberus/cmd.version=$(VERSION)
 
 .PHONY: build test vet clean release
 

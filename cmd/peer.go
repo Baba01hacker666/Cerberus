@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/baba01hacker/cerberus/internal/control"
-	"github.com/baba01hacker/cerberus/internal/store"
+	"github.com/Baba01hacker666/cerberus/internal/control"
+	"github.com/Baba01hacker666/cerberus/internal/store"
 	"github.com/spf13/cobra"
 )
 

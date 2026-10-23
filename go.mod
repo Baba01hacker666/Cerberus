@@ -1,4 +1,4 @@
-module github.com/baba01hacker/cerberus
+module github.com/Baba01hacker666/cerberus
 
 go 1.22.0
 

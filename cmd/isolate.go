@@ -3,9 +3,9 @@ package cmd
 import (
 	"fmt"
 
-	"github.com/baba01hacker/cerberus/internal/config"
-	"github.com/baba01hacker/cerberus/internal/isolation"
-	"github.com/baba01hacker/cerberus/internal/store"
+	"github.com/Baba01hacker666/cerberus/internal/config"
+	"github.com/Baba01hacker666/cerberus/internal/isolation"
+	"github.com/Baba01hacker666/cerberus/internal/store"
 	"github.com/spf13/cobra"
 )
 

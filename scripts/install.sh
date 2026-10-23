@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Cerberus one-liner installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/baba01hacker/cerberus/main/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/Baba01hacker666/cerberus/main/scripts/install.sh | bash
 
-REPO="baba01hacker/cerberus"
+REPO="Baba01hacker666/cerberus"
 BIN="cerberus"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/cerberus}"

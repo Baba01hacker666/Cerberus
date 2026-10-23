@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/baba01hacker/cerberus/cmd"
+	"github.com/Baba01hacker666/cerberus/cmd"
 )
 
 func main() {

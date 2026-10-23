@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"net"
 
-	"github.com/baba01hacker/cerberus/internal/config"
-	"github.com/baba01hacker/cerberus/internal/wireguard"
+	"github.com/Baba01hacker666/cerberus/internal/config"
+	"github.com/Baba01hacker666/cerberus/internal/wireguard"
 	"github.com/spf13/cobra"
 )
 

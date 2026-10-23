@@ -32,6 +32,9 @@ cerberus peer add http://peer-host:7443
 # Manual peer
 cerberus peer add --pubkey <key> --endpoint host:51820 --ip 10.77.0.5 --name peer1
 
+# Client mode (join mesh from a container/host)
+cerberus client --server http://hub:7443 --name worker1
+
 # Isolation
 cerberus isolate block 10.77.0.2 10.77.0.3
 cerberus isolate allow 10.77.0.2 10.77.0.3

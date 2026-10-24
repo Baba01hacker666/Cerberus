@@ -84,6 +84,7 @@ func runClientCommand(cmd *cobra.Command, args []string) error {
 		Ephemeral:     ephemeral,
 		UserspaceOnly: userspace,
 		ForceTCP:      forceTCP,
+		CAFile:        c.TLS.CAFile,
 	})
 	if err != nil {
 		return err

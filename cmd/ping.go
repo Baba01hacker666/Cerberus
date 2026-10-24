@@ -25,6 +25,7 @@ var pingCmd = &cobra.Command{
 		}
 		cl := control.NewClient(serverURL)
 		cl.AuthToken = c.AuthToken
+		cl.CAFile = c.TLS.CAFile
 
 		target := args[0]
 		sent := 0

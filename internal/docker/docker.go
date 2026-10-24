@@ -72,10 +72,13 @@ func ListContainers(socket, labelFilter string) ([]Container, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	args := []string{"ps", "--format", "{{json .}}"}
-	if labelFilter != "" {
-		args = []string{"ps", "--filter", "label=" + labelFilter, "--format", "{{json .}}"}
+	args := []string{"ps"}
+	for _, f := range strings.Split(strings.ReplaceAll(labelFilter, " ", ","), ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			args = append(args, "--filter", "label="+f)
+		}
 	}
+	args = append(args, "--format", "{{json .}}")
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	if socket != "" {
 		cmd.Env = append(cmd.Environ(), "DOCKER_HOST=unix://"+socket)

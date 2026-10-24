@@ -21,9 +21,12 @@ var peerListCmd = &cobra.Command{
 		c := mustCfg()
 		cl := control.NewClient(localServerURL(c))
 		cl.AuthToken = c.AuthToken
+		cl.CAFile = c.TLS.CAFile
 		var peers []store.Peer
 		if live, err := cl.ListPeers(); err == nil {
 			peers = live
+		} else if control.IsHTTPError(err) {
+			return err
 		} else {
 			peers = store.New(dataDir()).List()
 		}
@@ -46,6 +49,7 @@ var peerAddCmd = &cobra.Command{
 			}
 			cl := control.NewClient(remote)
 			cl.AuthToken = c.AuthToken
+			cl.CAFile = c.TLS.CAFile
 			jr, err := cl.Join(control.RegisterReq{
 				Name:      c.NodeName,
 				PublicKey: c.PublicKey,
@@ -80,6 +84,7 @@ var peerAddCmd = &cobra.Command{
 		// Try live daemon first so WireGuard reconciles immediately!
 		cl := control.NewClient(localServerURL(c))
 		cl.AuthToken = c.AuthToken
+		cl.CAFile = c.TLS.CAFile
 		if created, err := cl.Register(control.RegisterReq{
 			Name:      name,
 			PublicKey: pub,
@@ -88,6 +93,8 @@ var peerAddCmd = &cobra.Command{
 		}); err == nil {
 			fmt.Println("added peer", created.ID, "->", created.MeshIP)
 			return nil
+		} else if control.IsHTTPError(err) {
+			return err
 		}
 
 		st := store.New(dataDir())
@@ -121,9 +128,12 @@ var peerRemoveCmd = &cobra.Command{
 		c := mustCfg()
 		cl := control.NewClient(localServerURL(c))
 		cl.AuthToken = c.AuthToken
+		cl.CAFile = c.TLS.CAFile
 		if err := cl.DeletePeer(args[0]); err == nil {
 			fmt.Println("removed", args[0])
 			return nil
+		} else if control.IsHTTPError(err) {
+			return err
 		}
 		st := store.New(dataDir())
 		st.Remove(args[0])

@@ -78,13 +78,22 @@ func ResolveDefaultPaths() (cfgPath, dataDir string) {
 	if os.Geteuid() == 0 {
 		return DefaultConfigPath, DefaultDataDir
 	}
-	// Check if /var/lib/cerberus is already writable
+	// Check if both the config dir and data dir are writable
+	cfgDir := filepath.Dir(DefaultConfigPath)
 	if info, err := os.Stat(DefaultDataDir); err == nil && info.IsDir() {
 		testFile := filepath.Join(DefaultDataDir, ".write-check")
 		if f, err := os.OpenFile(testFile, os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
 			_ = f.Close()
 			_ = os.Remove(testFile)
-			return DefaultConfigPath, DefaultDataDir
+			// Also verify config directory is writable
+			if info2, err2 := os.Stat(cfgDir); err2 == nil && info2.IsDir() {
+				testCfg := filepath.Join(cfgDir, ".write-check")
+				if f2, err3 := os.OpenFile(testCfg, os.O_CREATE|os.O_WRONLY, 0o600); err3 == nil {
+					_ = f2.Close()
+					_ = os.Remove(testCfg)
+					return DefaultConfigPath, DefaultDataDir
+				}
+			}
 		}
 	}
 	home, err := os.UserHomeDir()

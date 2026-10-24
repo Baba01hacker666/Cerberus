@@ -28,6 +28,7 @@ var isolateBlockCmd = &cobra.Command{
 		// Apply live via running server control API if running!
 		cl := control.NewClient(localServerURL(c))
 		cl.AuthToken = c.AuthToken
+		cl.CAFile = c.TLS.CAFile
 		if _, err := cl.BlockPeers(src, dst); err == nil {
 			if dst != "" {
 				fmt.Println("blocked", src, "->", dst, "(live)")
@@ -35,6 +36,8 @@ var isolateBlockCmd = &cobra.Command{
 				fmt.Println("quarantined peer", src, "(live)")
 			}
 			return nil
+		} else if control.IsHTTPError(err) {
+			return err
 		}
 		// Offline fallback: persist to config and apply iptables if available
 		rule := src
@@ -63,9 +66,12 @@ var isolateAllowCmd = &cobra.Command{
 		c := mustCfg()
 		cl := control.NewClient(localServerURL(c))
 		cl.AuthToken = c.AuthToken
+		cl.CAFile = c.TLS.CAFile
 		if _, err := cl.AllowPeers(args[0], args[1]); err == nil {
 			fmt.Println("allowed", args[0], "->", args[1], "(live)")
 			return nil
+		} else if control.IsHTTPError(err) {
+			return err
 		}
 		rule := args[0] + "->" + args[1]
 		c.Isolation.AllowedPeers = append(c.Isolation.AllowedPeers, rule)
@@ -104,9 +110,12 @@ var isolateApplyCmd = &cobra.Command{
 		c := mustCfg()
 		cl := control.NewClient(localServerURL(c))
 		cl.AuthToken = c.AuthToken
+		cl.CAFile = c.TLS.CAFile
 		if _, err := cl.SetIsolationPolicy(c.Isolation.Enabled, c.Isolation.DefaultDeny); err == nil {
 			fmt.Println("applied isolation policy (live)")
 			return nil
+		} else if control.IsHTTPError(err) {
+			return err
 		}
 
 		st := store.New(dataDir())

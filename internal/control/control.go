@@ -5,12 +5,15 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,19 +39,19 @@ type State struct {
 	mu          sync.RWMutex
 	reconcileMu sync.Mutex
 	Cfg         *config.Config
-	CfgPath    string
-	Store      *store.Store
-	Allocator  *mesh.Allocator
-	Policy     *isolation.PolicyEngine
-	Firewall   *isolation.Manager
-	Tunnel     *tunnel.Tunnel
-	StartedAt  time.Time
-	ServerCtx  context.Context
+	CfgPath     string
+	Store       *store.Store
+	Allocator   *mesh.Allocator
+	Policy      *isolation.PolicyEngine
+	Firewall    *isolation.Manager
+	Tunnel      *tunnel.Tunnel
+	StartedAt   time.Time
+	ServerCtx   context.Context
 
-	version    atomic.Uint64
-	subsMu     sync.Mutex
-	subs       map[uint64]chan uint64
-	nextSubID  uint64
+	version   atomic.Uint64
+	subsMu    sync.Mutex
+	subs      map[uint64]chan uint64
+	nextSubID uint64
 }
 
 type StateOptions struct {
@@ -355,6 +358,19 @@ func (s *State) checkServerToken(r *http.Request, bodyToken string) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
 }
 
+// checkPeerServerToken is like checkServerToken but never treats an unset server
+// token as authorization. Peer endpoints must authenticate with either a real
+// server token or the per-peer secret.
+func (s *State) checkPeerServerToken(r *http.Request) bool {
+	s.mu.RLock()
+	expected := s.Cfg.AuthToken
+	s.mu.RUnlock()
+	if expected == "" {
+		return false
+	}
+	return s.checkServerToken(r, "")
+}
+
 // provisionPeer implements smart zero-setup registration (used by both POST /join and POST /peers).
 func (s *State) provisionPeer(r *http.Request, req RegisterReq, allowSyntheticKey bool) (*JoinResp, int, error) {
 	if !s.checkServerToken(r, req.Token) {
@@ -394,17 +410,33 @@ func (s *State) provisionPeer(r *http.Request, req RegisterReq, allowSyntheticKe
 
 	if req.PeerID != "" {
 		if p, ok := s.Store.Get(req.PeerID); ok {
-			if p.PeerSecret != "" && subtle.ConstantTimeCompare([]byte(p.PeerSecret), []byte(suppliedSecret)) == 1 {
-				existingPeer = &p
-			} else if p.PublicKey == pubKey && (p.PeerSecret == "" || suppliedSecret == "") {
-				existingPeer = &p
+			if p.PeerSecret != "" {
+				// Require matching secret for reconnect when one is stored.
+				if suppliedSecret != "" && subtle.ConstantTimeCompare([]byte(p.PeerSecret), []byte(suppliedSecret)) == 1 {
+					// If the client supplied a key, require it to match; a server-generated
+					// replacement key is allowed after authenticating with the secret.
+					if generatedPriv != "" || p.PublicKey == "" || p.PublicKey == pubKey {
+						existingPeer = &p
+					}
+				}
+			} else {
+				// No stored secret: only allow reconnect if no secret supplied and same public key.
+				if suppliedSecret == "" && (pubKey == "" || p.PublicKey == pubKey) {
+					existingPeer = &p
+				}
 			}
 		}
 	}
 	if existingPeer == nil && pubKey != "" {
 		if p, ok := s.Store.FindByPublicKey(pubKey); ok {
-			if p.PeerSecret == "" || suppliedSecret == "" || subtle.ConstantTimeCompare([]byte(p.PeerSecret), []byte(suppliedSecret)) == 1 {
-				existingPeer = &p
+			if p.PeerSecret != "" {
+				if suppliedSecret != "" && subtle.ConstantTimeCompare([]byte(p.PeerSecret), []byte(suppliedSecret)) == 1 {
+					existingPeer = &p
+				}
+			} else {
+				if suppliedSecret == "" {
+					existingPeer = &p
+				}
 			}
 		}
 	}
@@ -652,7 +684,11 @@ func (s *State) Handler() http.Handler {
 			writeErr(w, http.StatusNotFound, fmt.Errorf("peer %q not registered", req.PeerID))
 			return
 		}
-		if p.PeerSecret != "" && subtle.ConstantTimeCompare([]byte(p.PeerSecret), []byte(req.PeerSecret)) != 1 && !s.checkServerToken(r, "") {
+		authorized := s.checkPeerServerToken(r)
+		if !authorized && p.PeerSecret != "" && req.PeerSecret != "" && subtle.ConstantTimeCompare([]byte(p.PeerSecret), []byte(req.PeerSecret)) == 1 {
+			authorized = true
+		}
+		if !authorized {
 			writeErr(w, http.StatusUnauthorized, fmt.Errorf("invalid peer secret"))
 			return
 		}
@@ -722,7 +758,11 @@ func (s *State) Handler() http.Handler {
 			writeErr(w, http.StatusNotFound, fmt.Errorf("unknown peer %q", peerID))
 			return
 		}
-		if p.PeerSecret != "" && subtle.ConstantTimeCompare([]byte(p.PeerSecret), []byte(secret)) != 1 && !s.checkServerToken(r, "") {
+		authorized := s.checkPeerServerToken(r)
+		if !authorized && p.PeerSecret != "" && secret != "" && subtle.ConstantTimeCompare([]byte(p.PeerSecret), []byte(secret)) == 1 {
+			authorized = true
+		}
+		if !authorized {
 			writeErr(w, http.StatusUnauthorized, fmt.Errorf("unauthorized peer stream"))
 			return
 		}
@@ -1017,21 +1057,75 @@ type Client struct {
 	AuthToken  string
 	PeerID     string
 	PeerSecret string
+	CAFile     string
 	HTTP       *http.Client
+
+	httpOnce sync.Once
+}
+
+// HTTPError represents a non-2xx response from the control plane. Transport-level
+// failures (connection refused, timeout, DNS) are returned as their original
+// (non-HTTPError) errors so callers can distinguish "daemon not running" from
+// "daemon rejected the request".
+type HTTPError struct {
+	StatusCode int
+	Status     string
+	Body       string
+	Op         string
+}
+
+func (e *HTTPError) Error() string {
+	if e.Body != "" {
+		return fmt.Sprintf("%s: %s: %s", e.Op, e.Status, e.Body)
+	}
+	return fmt.Sprintf("%s: %s", e.Op, e.Status)
+}
+
+func IsHTTPError(err error) bool {
+	var he *HTTPError
+	return errors.As(err, &he)
 }
 
 func NewClient(baseURL string) *Client {
-	tr := &http.Transport{
-		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-		MaxIdleConnsPerHost: 16,
-	}
 	return &Client{
 		BaseURL: strings.TrimRight(baseURL, "/"),
-		HTTP: &http.Client{
+	}
+}
+
+// TLSClientConfig builds a strict TLS config for the control plane connections.
+// Certificate verification is enabled (via CAFile when configured, otherwise the
+// system roots) with a minimum TLS version of 1.2.
+func (c *Client) TLSClientConfig() *tls.Config {
+	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
+	if c.CAFile != "" {
+		if caBytes, err := os.ReadFile(c.CAFile); err == nil {
+			caPool := x509.NewCertPool()
+			if caPool.AppendCertsFromPEM(caBytes) {
+				cfg.RootCAs = caPool
+			} else if systemPool, serr := x509.SystemCertPool(); serr == nil {
+				cfg.RootCAs = systemPool
+			}
+		}
+	}
+	return cfg
+}
+
+// HTTPClient returns a shared lazily-created HTTP client bound to the configured TLS settings.
+func (c *Client) HTTPClient() *http.Client {
+	c.httpOnce.Do(func() {
+		if c.HTTP != nil {
+			return
+		}
+		tr := &http.Transport{
+			TLSClientConfig:     c.TLSClientConfig(),
+			MaxIdleConnsPerHost: 16,
+		}
+		c.HTTP = &http.Client{
 			Timeout:   15 * time.Second,
 			Transport: tr,
-		},
-	}
+		}
+	})
+	return c.HTTP
 }
 
 func (c *Client) addHeaders(req *http.Request) {
@@ -1052,14 +1146,14 @@ func (c *Client) Info() (*InfoResp, error) {
 		return nil, err
 	}
 	c.addHeaders(req)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTPClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("info: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: strings.TrimSpace(string(b)), Op: "info"}
 	}
 	var info InfoResp
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
@@ -1074,14 +1168,14 @@ func (c *Client) Status() (*StatusResp, error) {
 		return nil, err
 	}
 	c.addHeaders(req)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTPClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("status: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: strings.TrimSpace(string(b)), Op: "status"}
 	}
 	var st StatusResp
 	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
@@ -1109,14 +1203,14 @@ func (c *Client) Join(req RegisterReq) (*JoinResp, error) {
 	hreq.Header.Set("Content-Type", "application/json")
 	c.addHeaders(hreq)
 
-	resp, err := c.HTTP.Do(hreq)
+	resp, err := c.HTTPClient().Do(hreq)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("join: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: strings.TrimSpace(string(body)), Op: "join"}
 	}
 	var jr JoinResp
 	if err := json.NewDecoder(resp.Body).Decode(&jr); err != nil {
@@ -1140,14 +1234,14 @@ func (c *Client) Heartbeat(endpoint string) (*HeartbeatResp, error) {
 	hreq.Header.Set("Content-Type", "application/json")
 	c.addHeaders(hreq)
 
-	resp, err := c.HTTP.Do(hreq)
+	resp, err := c.HTTPClient().Do(hreq)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("heartbeat: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: strings.TrimSpace(string(body)), Op: "heartbeat"}
 	}
 	var hr HeartbeatResp
 	if err := json.NewDecoder(resp.Body).Decode(&hr); err != nil {
@@ -1160,7 +1254,7 @@ func (c *Client) Heartbeat(endpoint string) (*HeartbeatResp, error) {
 func (c *Client) WatchEvents(ctx context.Context, onUpdate func(version uint64)) error {
 	streamHTTP := &http.Client{
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			TLSClientConfig: c.TLSClientConfig(),
 		},
 	}
 	hreq, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/events", nil)
@@ -1174,7 +1268,7 @@ func (c *Client) WatchEvents(ctx context.Context, onUpdate func(version uint64))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("events status: %s", resp.Status)
+		return &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Op: "events"}
 	}
 	sc := bufio.NewScanner(resp.Body)
 	for sc.Scan() {
@@ -1199,14 +1293,14 @@ func (c *Client) ListPeers() ([]store.Peer, error) {
 		return nil, err
 	}
 	c.addHeaders(req)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTPClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("list peers: %s: %s", resp.Status, strings.TrimSpace(string(b)))
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: strings.TrimSpace(string(b)), Op: "list peers"}
 	}
 	var peers []store.Peer
 	if err := json.NewDecoder(resp.Body).Decode(&peers); err != nil {
@@ -1226,14 +1320,14 @@ func (c *Client) Register(req RegisterReq) (*store.Peer, error) {
 	}
 	hreq.Header.Set("Content-Type", "application/json")
 	c.addHeaders(hreq)
-	resp, err := c.HTTP.Do(hreq)
+	resp, err := c.HTTPClient().Do(hreq)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("register: %s: %s", resp.Status, strings.TrimSpace(string(body)) )
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: strings.TrimSpace(string(body)), Op: "register"}
 	}
 	var p store.Peer
 	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
@@ -1248,14 +1342,14 @@ func (c *Client) DeletePeer(id string) error {
 		return err
 	}
 	c.addHeaders(req)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTPClient().Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("delete: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: strings.TrimSpace(string(body)), Op: "delete"}
 	}
 	return nil
 }
@@ -1271,14 +1365,14 @@ func (c *Client) PingPeer(target string, timeout time.Duration) (float64, string
 	}
 	req.Header.Set("Content-Type", "application/json")
 	c.addHeaders(req)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTPClient().Do(req)
 	if err != nil {
 		return 0, "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return 0, "", fmt.Errorf("ping: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return 0, "", &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: strings.TrimSpace(string(body)), Op: "ping"}
 	}
 	var out struct {
 		Target string  `json:"target"`
@@ -1310,14 +1404,14 @@ func (c *Client) postIsolation(path string, payload IsolationRuleReq) (*config.I
 	}
 	req.Header.Set("Content-Type", "application/json")
 	c.addHeaders(req)
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTPClient().Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("isolation: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		return nil, &HTTPError{StatusCode: resp.StatusCode, Status: resp.Status, Body: strings.TrimSpace(string(body)), Op: "isolation"}
 	}
 	var iso config.IsolationConfig
 	if err := json.NewDecoder(resp.Body).Decode(&iso); err != nil {

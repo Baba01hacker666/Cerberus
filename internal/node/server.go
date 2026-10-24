@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -113,6 +114,7 @@ func StartServer(parentCtx context.Context, opts ServerOptions) (*Server, error)
 		UserspaceOnly: c.UserspaceOnly,
 		ForceTCP:      opts.ForceTCP,
 		Policy:        pol,
+		CAFile:        c.TLS.CAFile,
 	})
 	if err := tun.Start(ctx); err != nil && desiredUDPPort != 0 {
 		// If the exact UDP port happened to be occupied by another UDP service on host, fall back cleanly to any free UDP port!
@@ -127,6 +129,7 @@ func StartServer(parentCtx context.Context, opts ServerOptions) (*Server, error)
 			UserspaceOnly: c.UserspaceOnly,
 			ForceTCP:      opts.ForceTCP,
 			Policy:        pol,
+			CAFile:        c.TLS.CAFile,
 		})
 		if err2 := tun.Start(ctx); err2 != nil {
 			cancel()
@@ -292,6 +295,7 @@ func (s *Server) syncPeersOnce() {
 		}
 		cl := control.NewClient(base)
 		cl.AuthToken = s.Cfg.AuthToken
+		cl.CAFile = s.Cfg.TLS.CAFile
 		info, err := cl.Info()
 		if err != nil {
 			continue
@@ -328,11 +332,35 @@ func (s *Server) syncPeersOnce() {
 			if existing, ok := s.Store.Get(rp.ID); ok && existing.Container != "" {
 				continue
 			}
-			if rp.MeshIP != "" {
-				_ = s.State.Allocator.ReserveForOwner(rp.ID, rp.MeshIP)
+			// Do not clobber a local peer that has a different public key.
+			if existing, ok := s.Store.Get(rp.ID); ok && existing.PublicKey != "" && existing.PublicKey != rp.PublicKey {
+				continue
 			}
-			if err := s.Store.Add(rp); err == nil {
-				changed = true
+			if rp.MeshIP != "" {
+				if err := s.State.Allocator.ReserveForOwner(rp.ID, rp.MeshIP); err != nil {
+					continue
+				}
+			}
+			existing, exists := s.Store.Get(rp.ID)
+			if exists {
+				// Remote listings strip secrets; preserve local credentials and metadata
+				// so a sync never breaks an existing peer's authentication.
+				rp.PeerSecret = existing.PeerSecret
+				rp.PresharedKey = existing.PresharedKey
+				if rp.Name == "" {
+					rp.Name = existing.Name
+				}
+				if rp.Container == "" {
+					rp.Container = existing.Container
+				}
+				if rp.Labels == nil {
+					rp.Labels = existing.Labels
+				}
+			}
+			if !exists || existing.PublicKey != rp.PublicKey || existing.Endpoint != rp.Endpoint || existing.MeshIP != rp.MeshIP || !slices.Equal(existing.AllowedIPs, rp.AllowedIPs) {
+				if err := s.Store.Add(rp); err == nil {
+					changed = true
+				}
 			}
 		}
 	}

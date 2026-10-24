@@ -90,11 +90,31 @@ func TestIptablesManagerOrderingAndConcurrency(t *testing.T) {
 	}
 
 	joined := strings.Join(mr.cmds, "\n")
-	dropIdx := strings.Index(joined, "-A CERBERUS -s 10.77.0.3 -d 10.77.0.2 -j DROP")
+	// 3->2 is a directional block (reverse 2->3 is allowed), so it must only
+	// drop NEW packets and still let replies to the permitted flow through.
+	dropIdx := strings.Index(joined, "-A CERBERUS -s 10.77.0.3 -d 10.77.0.2 -m conntrack --ctstate NEW -j DROP")
 	ctIdx := strings.Index(joined, "ESTABLISHED,RELATED")
 	accIdx := strings.Index(joined, "-A CERBERUS -s 10.77.0.2 -d 10.77.0.3 -j ACCEPT")
-	if dropIdx < 0 || ctIdx < 0 || accIdx < 0 || !(dropIdx < ctIdx && ctIdx < accIdx) {
-		t.Fatalf("expected explicit DROP before ESTABLISHED conntrack before ACCEPT, got:\n%s", joined)
+	if dropIdx < 0 || ctIdx < 0 || accIdx < 0 || dropIdx >= ctIdx || ctIdx >= accIdx {
+		t.Fatalf("expected NEW-only directional DROP before ESTABLISHED conntrack before ACCEPT, got:\n%s", joined)
+	}
+
+	// A bidirectional/quarantine block must still be unconditional so existing
+	// sessions are severed immediately.
+	mr.mu.Lock()
+	mr.cmds = nil
+	mr.mu.Unlock()
+	quarantine := map[string]map[string]bool{
+		"10.77.0.2": {},
+		"10.77.0.3": {},
+	}
+	if err := mgr.ApplyPolicy(peers, quarantine, false); err != nil {
+		t.Fatalf("ApplyPolicy quarantine: %v", err)
+	}
+	qJoined := strings.Join(mr.cmds, "\n")
+	qDrop := "-A CERBERUS -s 10.77.0.2 -d 10.77.0.3 -j DROP"
+	if !strings.Contains(qJoined, qDrop) {
+		t.Fatalf("expected unconditional DROP for bidirectional/quarantine block, got:\n%s", qJoined)
 	}
 
 	// Parallel packet evaluation + hot policy swap under -race

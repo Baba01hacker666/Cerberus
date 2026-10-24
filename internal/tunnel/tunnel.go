@@ -39,15 +39,16 @@ type TunnelConfig struct {
 	ForceTCP      bool // disables raw UDP so WireGuard tunnels strictly over single-port TCP
 	VerboseLogs   bool
 	Policy        *isolation.PolicyEngine
+	CAFile        string // optional CA bundle for HTTPS control-plane verification
 }
 
 // PeerRuntimeStats reports real live cryptographic session metrics from wireguard-go.
 type PeerRuntimeStats struct {
-	PublicKey           string `json:"public_key"`
-	Endpoint            string `json:"endpoint"`
-	TxBytes             uint64 `json:"tx_bytes"`
-	RxBytes             uint64 `json:"rx_bytes"`
-	LastHandshakeTimeSec int64 `json:"last_handshake_sec"`
+	PublicKey            string `json:"public_key"`
+	Endpoint             string `json:"endpoint"`
+	TxBytes              uint64 `json:"tx_bytes"`
+	RxBytes              uint64 `json:"rx_bytes"`
+	LastHandshakeTimeSec int64  `json:"last_handshake_sec"`
 }
 
 type appliedPeer struct {
@@ -72,8 +73,9 @@ type Tunnel struct {
 	stopOnce   sync.Once
 	stopCh     chan struct{}
 
-	activePeers map[string]appliedPeer // keyed by hex public key
-	lastDesired []PeerConfig
+	activePeers     map[string]appliedPeer // keyed by hex public key
+	lastDesired     []PeerConfig
+	needsFullResync bool
 }
 
 func New(cfg TunnelConfig) *Tunnel {
@@ -84,6 +86,7 @@ func New(cfg TunnelConfig) *Tunnel {
 		cfg.MTU = MTU
 	}
 	b := NewHybridBind()
+	b.SetCAFile(cfg.CAFile)
 	if cfg.ForceTCP {
 		b.DisableUDP(true)
 	}
@@ -236,6 +239,8 @@ func (t *Tunnel) Start(ctx context.Context) error {
 
 func (t *Tunnel) Stop() {
 	t.stopOnce.Do(func() {
+		t.reconcileMu.Lock()
+		defer t.reconcileMu.Unlock()
 		close(t.stopCh)
 		t.mu.Lock()
 		t.running = false
@@ -279,6 +284,11 @@ func (t *Tunnel) UpdatePeers(peers []PeerConfig) {
 		return
 	}
 
+	fullResync := t.needsFullResync
+	if fullResync {
+		t.activePeers = make(map[string]appliedPeer)
+	}
+
 	// Update RouterTUN peer IP set first so any hairpinned mesh traffic routes immediately
 	meshIPs := make([]string, 0, len(peers))
 	desiredMap := make(map[string]appliedPeer, len(peers))
@@ -299,12 +309,21 @@ func (t *Tunnel) UpdatePeers(peers []PeerConfig) {
 		}
 		var allowed []string
 		if len(pc.AllowedIPs) > 0 {
-			allowed = append(allowed, pc.AllowedIPs...)
+			for _, a := range pc.AllowedIPs {
+				if _, err := netip.ParsePrefix(a); err == nil {
+					allowed = append(allowed, a)
+				}
+			}
 		} else if pc.MeshIP != "" {
 			if strings.Contains(pc.MeshIP, "/") {
-				allowed = []string{pc.MeshIP}
+				if _, err := netip.ParsePrefix(pc.MeshIP); err == nil {
+					allowed = []string{pc.MeshIP}
+				}
 			} else {
-				allowed = []string{pc.MeshIP + "/32"}
+				cidr := pc.MeshIP + "/32"
+				if _, err := netip.ParsePrefix(cidr); err == nil {
+					allowed = []string{cidr}
+				}
 			}
 		}
 		if len(allowed) == 0 {
@@ -327,6 +346,9 @@ func (t *Tunnel) UpdatePeers(peers []PeerConfig) {
 	}
 
 	var uapi strings.Builder
+	if fullResync {
+		uapi.WriteString("replace_peers=true\n")
+	}
 
 	// 1. Remove peers that disappeared
 	for pubHex := range t.activePeers {
@@ -371,7 +393,14 @@ func (t *Tunnel) UpdatePeers(peers []PeerConfig) {
 
 	cmd := uapi.String()
 	if cmd != "" {
-		_ = wgDev.IpcSet(cmd)
+		if err := wgDev.IpcSet(cmd); err != nil {
+			t.activePeers = make(map[string]appliedPeer)
+			t.needsFullResync = true
+		} else {
+			t.needsFullResync = false
+		}
+	} else {
+		t.needsFullResync = false
 	}
 }
 

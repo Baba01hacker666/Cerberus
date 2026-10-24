@@ -31,14 +31,26 @@ while [ $# -gt 0 ]; do
       ;;
     --client)
       MODE="client"
-      SERVER_ADDR="${2:-}"
+      if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "--client requires a server address" >&2
+        exit 1
+      fi
+      SERVER_ADDR="$2"
       shift 2
       ;;
     --port)
-      PORT="${2:-7443}"
+      if [ $# -lt 2 ] || [ -z "${2:-}" ]; then
+        echo "--port requires a value" >&2
+        exit 1
+      fi
+      PORT="$2"
       shift 2
       ;;
     --token)
+      if [ $# -lt 2 ]; then
+        echo "--token requires a value" >&2
+        exit 1
+      fi
       TOKEN="${2:-}"
       shift 2
       ;;
@@ -97,7 +109,11 @@ if command -v systemctl >/dev/null 2>&1; then
   if [ -n "$TOKEN" ]; then
     TOKEN_ARG="--token ${TOKEN}"
   fi
-  if [ "$MODE" = "client" ] && [ -n "$SERVER_ADDR" ]; then
+  if [ "$MODE" = "client" ]; then
+    if [ -z "$SERVER_ADDR" ]; then
+      echo "client mode requires a server address" >&2
+      exit 1
+    fi
     EXEC_CMD="${INSTALL_DIR}/${BIN} --config ${CONFIG_DIR}/config.yaml client ${SERVER_ADDR} ${TOKEN_ARG}"
   else
     EXEC_CMD="${INSTALL_DIR}/${BIN} --config ${CONFIG_DIR}/config.yaml server --port ${PORT} ${TOKEN_ARG}"

@@ -17,6 +17,7 @@ var statusCmd = &cobra.Command{
 		c := mustCfg()
 		cl := control.NewClient(localServerURL(c))
 		cl.AuthToken = c.AuthToken
+		cl.CAFile = c.TLS.CAFile
 		if live, err := cl.Status(); err == nil {
 			fmt.Println("status:            running (live)")
 			fmt.Println("node:             ", live.Info.NodeName)

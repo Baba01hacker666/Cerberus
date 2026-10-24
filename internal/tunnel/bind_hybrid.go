@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -128,6 +130,8 @@ type HybridBind struct {
 
 	probesMu sync.Mutex
 	probes   map[[8]byte]chan struct{}
+
+	caFile string
 }
 
 func NewHybridBind() *HybridBind {
@@ -136,6 +140,27 @@ func NewHybridBind() *HybridBind {
 		streams: make(map[string]*tcpStreamConn),
 		probes:  make(map[[8]byte]chan struct{}),
 	}
+}
+
+// SetCAFile configures the CA bundle used to verify HTTPS control-plane
+// connections. An empty path uses the system roots.
+func (b *HybridBind) SetCAFile(path string) {
+	b.caFile = path
+}
+
+func (b *HybridBind) tlsClientConfig(serverName string) *tls.Config {
+	cfg := &tls.Config{ServerName: serverName, MinVersion: tls.VersionTLS12}
+	if b.caFile != "" {
+		if caBytes, err := os.ReadFile(b.caFile); err == nil {
+			pool := x509.NewCertPool()
+			if pool.AppendCertsFromPEM(caBytes) {
+				cfg.RootCAs = pool
+			} else if systemPool, serr := x509.SystemCertPool(); serr == nil {
+				cfg.RootCAs = systemPool
+			}
+		}
+	}
+	return cfg
 }
 
 // DisableUDP forces all WireGuard traffic away from raw UDP (useful for testing single-TCP-port firewalls or --tcp-only).
@@ -497,10 +522,9 @@ func (b *HybridBind) dialClientStreamOnce(
 	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 15 * time.Second}
 	var rawConn net.Conn
 	if u.Scheme == "https" {
-		rawConn, err = tls.DialWithDialer(dialer, "tcp", host, &tls.Config{
-			ServerName:         u.Hostname(),
-			InsecureSkipVerify: true, // WireGuard already authenticates & encrypts every inner packet end-to-end!
-		})
+		// WireGuard still authenticates & encrypts every inner packet end-to-end;
+		// the control-plane credentials on this stream MUST be protected by TLS verification.
+		rawConn, err = tls.DialWithDialer(dialer, "tcp", host, b.tlsClientConfig(u.Hostname()))
 	} else {
 		rawConn, err = dialer.DialContext(ctx, "tcp", host)
 	}
@@ -522,7 +546,9 @@ func (b *HybridBind) dialClientStreamOnce(
 	if peerSecret != "" {
 		req.Header.Set("X-Cerberus-Peer-Secret", peerSecret)
 	}
-	if authToken != "" {
+	if authToken != "" && (peerID == "" || peerSecret == "") {
+		// Only send the server-wide auth token when no per-peer credentials are in use,
+		// so per-peer secrets stay the single source of truth for authenticated streams.
 		req.Header.Set("Authorization", "Bearer "+authToken)
 	}
 

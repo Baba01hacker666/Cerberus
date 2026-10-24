@@ -477,8 +477,8 @@ func (m *Manager) ApplyPolicy(peers []string, allowed map[string]map[string]bool
 		if restoreBin, ok := iptablesRestoreBin(); ok {
 			var sb strings.Builder
 			sb.WriteString("*filter\n")
-			sb.WriteString(fmt.Sprintf(":%s - [0:0]\n", m.Chain))
-			sb.WriteString(fmt.Sprintf("-F %s\n", m.Chain))
+			fmt.Fprintf(&sb, ":%s - [0:0]\n", m.Chain)
+			fmt.Fprintf(&sb, "-F %s\n", m.Chain)
 			for i, src := range peers {
 				for j, dst := range peers {
 					if i == j {
@@ -486,11 +486,19 @@ func (m *Manager) ApplyPolicy(peers []string, allowed map[string]map[string]bool
 					}
 					isAllowed := allowed != nil && allowed[src] != nil && allowed[src][dst]
 					if !defaultDeny && !isAllowed {
-						sb.WriteString(fmt.Sprintf("-A %s -s %s -d %s -j DROP\n", m.Chain, src, dst))
+						reverseAllowed := allowed != nil && allowed[dst] != nil && allowed[dst][src]
+						if reverseAllowed {
+							// Directional block: only drop NEW packets so replies to the
+							// permitted reverse flow keep working.
+							fmt.Fprintf(&sb, "-A %s -s %s -d %s -m conntrack --ctstate NEW -j DROP\n", m.Chain, src, dst)
+						} else {
+							// Full quarantine / bidirectional block: sever existing sessions too.
+							fmt.Fprintf(&sb, "-A %s -s %s -d %s -j DROP\n", m.Chain, src, dst)
+						}
 					}
 				}
 			}
-			sb.WriteString(fmt.Sprintf("-A %s -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n", m.Chain))
+			fmt.Fprintf(&sb, "-A %s -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT\n", m.Chain)
 			if defaultDeny {
 				for i, src := range peers {
 					for j, dst := range peers {
@@ -498,14 +506,14 @@ func (m *Manager) ApplyPolicy(peers []string, allowed map[string]map[string]bool
 							continue
 						}
 						if allowed != nil && allowed[src] != nil && allowed[src][dst] {
-							sb.WriteString(fmt.Sprintf("-A %s -s %s -d %s -j ACCEPT\n", m.Chain, src, dst))
+							fmt.Fprintf(&sb, "-A %s -s %s -d %s -j ACCEPT\n", m.Chain, src, dst)
 						} else {
-							sb.WriteString(fmt.Sprintf("-A %s -s %s -d %s -j DROP\n", m.Chain, src, dst))
+							fmt.Fprintf(&sb, "-A %s -s %s -d %s -j DROP\n", m.Chain, src, dst)
 						}
 					}
 				}
 			}
-			sb.WriteString(fmt.Sprintf("-A %s -j RETURN\n", m.Chain))
+			fmt.Fprintf(&sb, "-A %s -j RETURN\n", m.Chain)
 			sb.WriteString("COMMIT\n")
 
 			cmd := exec.Command(restoreBin, "--noflush")
@@ -530,7 +538,13 @@ func (m *Manager) ApplyPolicy(peers []string, allowed map[string]map[string]bool
 			}
 			isAllowed := allowed != nil && allowed[src] != nil && allowed[src][dst]
 			if !defaultDeny && !isAllowed {
-				if out, err := m.Runner.Run("iptables", "-A", m.Chain, "-s", src, "-d", dst, "-j", "DROP"); err != nil {
+				args := []string{"-A", m.Chain, "-s", src, "-d", dst}
+				if reverseAllowed := allowed != nil && allowed[dst] != nil && allowed[dst][src]; reverseAllowed {
+					// Directional block: preserve replies to the permitted reverse flow.
+					args = append(args, "-m", "conntrack", "--ctstate", "NEW")
+				}
+				args = append(args, "-j", "DROP")
+				if out, err := m.Runner.Run("iptables", args...); err != nil {
 					return fmt.Errorf("iptables drop %s->%s: %w: %s", src, dst, err, strings.TrimSpace(string(out)))
 				}
 			}

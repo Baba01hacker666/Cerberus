@@ -20,17 +20,18 @@ import (
 )
 
 type ClientOptions struct {
-	ServerAddr     string // e.g. "1.2.3.4:7443" or "http://1.2.3.4:7443"
-	Name           string // optional; defaults to OS hostname
-	Interface      string // default "cerberus0"
-	ListenPort     int    // default 0 = OS ephemeral port (zero conflict!)
-	Endpoint       string // optional explicit public endpoint
-	Token          string // optional server auth token
-	StateDir       string // optional local state dir to preserve identity/IP across restarts
-	Ephemeral      bool   // if true, generate brand-new identity without persisting state, and deregister on exit
-	UserspaceOnly  bool   // skip kernel TUN device (used in unprivileged mode & unit tests)
-	ForceTCP       bool   // force WireGuard-over-TCP single-port transport
-	ProbeTimeout   time.Duration
+	ServerAddr    string // e.g. "1.2.3.4:7443" or "http://1.2.3.4:7443"
+	Name          string // optional; defaults to OS hostname
+	Interface     string // default "cerberus0"
+	ListenPort    int    // default 0 = OS ephemeral port (zero conflict!)
+	Endpoint      string // optional explicit public endpoint
+	Token         string // optional server auth token
+	StateDir      string // optional local state dir to preserve identity/IP across restarts
+	Ephemeral     bool   // if true, generate brand-new identity without persisting state, and deregister on exit
+	UserspaceOnly bool   // skip kernel TUN device (used in unprivileged mode & unit tests)
+	ForceTCP      bool   // force WireGuard-over-TCP single-port transport
+	CAFile        string // optional CA bundle for HTTPS server verification
+	ProbeTimeout  time.Duration
 }
 
 type savedClientIdentity struct {
@@ -44,10 +45,10 @@ type savedClientIdentity struct {
 }
 
 // Client manages a zero-setup Cerberus mesh client node:
-//   1. Contacts the Smart Server on its single open port and auto-receives keys, PSK, IP, and topology
-//   2. Automatically probes native WireGuard UDP on that port and uses native UDP if reachable,
-//      OR seamlessly tunnels encrypted WireGuard over HTTP-Upgrade TCP on the exact same port if UDP is blocked
-//   3. Subscribes to live SSE updates + periodic heartbeats so new peers are discovered immediately
+//  1. Contacts the Smart Server on its single open port and auto-receives keys, PSK, IP, and topology
+//  2. Automatically probes native WireGuard UDP on that port and uses native UDP if reachable,
+//     OR seamlessly tunnels encrypted WireGuard over HTTP-Upgrade TCP on the exact same port if UDP is blocked
+//  3. Subscribes to live SSE updates + periodic heartbeats so new peers are discovered immediately
 type Client struct {
 	opts      ClientOptions
 	api       *control.Client
@@ -121,6 +122,7 @@ func StartClient(parentCtx context.Context, opts ClientOptions) (*Client, error)
 
 	api := control.NewClient(baseURL)
 	api.AuthToken = opts.Token
+	api.CAFile = opts.CAFile
 	api.PeerID = saved.PeerID
 	api.PeerSecret = saved.PeerSecret
 
@@ -185,6 +187,7 @@ func StartClient(parentCtx context.Context, opts ClientOptions) (*Client, error)
 		IsServer:      false,
 		UserspaceOnly: opts.UserspaceOnly,
 		ForceTCP:      opts.ForceTCP,
+		CAFile:        opts.CAFile,
 	})
 	if err := tun.Start(ctx); err != nil {
 		cancel()

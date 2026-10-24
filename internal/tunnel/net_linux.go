@@ -30,8 +30,12 @@ func osTunnelSupported() bool {
 }
 
 func createAndConfigureOSTUN(name, meshIPPrefix string, mtu int) (tun.Device, string, error) {
-	// Clean up stale residual TUN interface with same name if leftover from crashed process
-	_ = exec.Command("ip", "link", "del", "dev", name).Run()
+	// Clean up stale residual TUN interface with same name if leftover from crashed process.
+	// Only delete when the existing interface is actually a TUN device, so we never
+	// destroy a live interface owned by another process or a real interface.
+	if err := exec.Command("ip", "link", "show", "dev", name, "type", "tun").Run(); err == nil {
+		_ = exec.Command("ip", "link", "del", "dev", name).Run()
+	}
 
 	dev, err := tun.CreateTUN(name, mtu)
 	if err != nil {

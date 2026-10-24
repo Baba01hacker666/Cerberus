@@ -4,331 +4,144 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"strings"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
-	"time"
 
-	"github.com/Baba01hacker666/cerberus/internal/config"
-	"github.com/Baba01hacker666/cerberus/internal/control"
-	"github.com/Baba01hacker666/cerberus/internal/docker"
-	"github.com/Baba01hacker666/cerberus/internal/isolation"
-	"github.com/Baba01hacker666/cerberus/internal/mesh"
-	"github.com/Baba01hacker666/cerberus/internal/store"
+	"github.com/Baba01hacker666/cerberus/internal/node"
 	"github.com/Baba01hacker666/cerberus/internal/tunnel"
 	"github.com/spf13/cobra"
 )
 
+var serverCmd = &cobra.Command{
+	Use:   "server",
+	Short: "Run Cerberus as the main Smart Server (single port for auto keys, IPAM, mesh & tunnel)",
+	RunE:  runServerCommand,
+}
+
 var daemonCmd = &cobra.Command{
 	Use:   "daemon",
-	Short: "Run the cerberus daemon (control plane + mesh)",
-	RunE: func(cmd *cobra.Command, args []string) error {
-		c := mustCfg()
-		// ensure keys
-		if c.PrivateKey == "" {
-			priv, pub, err := tunnel.GenerateKeyPair()
-			if err != nil {
-				return err
-			}
-			c.PrivateKey = priv
-			c.PublicKey = pub
-			_ = c.Save(cfgFileOr(c))
-		}
-		st := store.New(c.DataDir)
-
-		// isolation manager
-		iso := isolation.New("CERBERUS")
-		if c.Isolation.Enabled && isolation.HasIptables() {
-			iso.EnsureChainNoErr()
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-
-		// tunnel instance
-		tun := tunnel.New(tunnel.TunnelConfig{
-			Name:       c.Interface,
-			PrivateKey: c.PrivateKey,
-			PublicKey:  c.PublicKey,
-			MeshIP:     mesh.MeshIPWithPrefix(firstIP(c), c.MeshCIDR),
-			ListenPort: 51820,
-		})
-		if tunnel.Available() {
-			if err := tun.Start(ctx); err != nil {
-				fmt.Fprintln(os.Stderr, "tunnel start:", err)
-			}
-		}
-
-		// docker auto-add loop
-		if c.Docker.AutoAdd {
-			go autoAddLoop(ctx, c, st)
-		}
-
-		// peer sync loop
-		go syncLoop(ctx, c, st)
-
-		// rebuild + apply loop
-		go reconcileLoop(ctx, c, st, iso, tun)
-
-		// control server
-		addr := c.ListenAddr
-		fmt.Println("cerberus daemon listening on", addr)
-		go func() {
-			if err := control.Serve(c, st, addr); err != nil {
-				fmt.Fprintln(os.Stderr, "control serve:", err)
-				cancel()
-			}
-		}()
-
-		// wait for signal
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		select {
-		case <-sigCh:
-		case <-ctx.Done():
-		}
-		cancel()
-		fmt.Println("shutting down")
-		return nil
-	},
+	Short: "Run the Cerberus server daemon (alias for `cerberus server`)",
+	RunE:  runServerCommand,
 }
 
-func cfgFileOr(c *config.Config) string {
-	if cfgFile != "" {
-		return cfgFile
-	}
-	return config.DefaultConfigPath
+func bindServerFlags(cmd *cobra.Command) {
+	cmd.Flags().IntP("port", "p", 0, "single port to open for both control HTTP/TCP and WireGuard UDP (default 7443)")
+	cmd.Flags().String("listen", "", "control plane TCP listen address (overrides --port, e.g. 0.0.0.0:7443)")
+	cmd.Flags().Int("udp-port", 0, "optional distinct WireGuard UDP port (defaults to same port as --port)")
+	cmd.Flags().String("cidr", "", "mesh IPv4 subnet CIDR (default 10.77.0.0/16)")
+	cmd.Flags().String("name", "", "server node name")
+	cmd.Flags().String("iface", "", "OS TUN interface name (default cerberus0)")
+	cmd.Flags().String("token", "", "require join secret token from clients")
+	cmd.Flags().Bool("gen-token", false, "auto-generate a random join token if none set")
+	cmd.Flags().Bool("default-deny", false, "enable zero-trust default-deny isolation between peers")
+	cmd.Flags().Bool("userspace", false, "run WireGuard in userspace without creating OS /dev/net/tun device")
+	cmd.Flags().Bool("tcp-only", false, "force single-port TCP transport (disable raw UDP)")
 }
 
-// EnsureChainNoErr wrapper
-func init() {
-	// noop
-}
+func runServerCommand(cmd *cobra.Command, _ []string) error {
+	c := mustCfg()
+	c.Role = "server"
 
-func autoAddLoop(ctx context.Context, c *config.Config, st *store.Store) {
-	ticker := time.NewTicker(15 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			containers, err := docker.ListContainers(c.Docker.Socket, "")
-			if err != nil {
-				continue
-			}
-			changed := false
-			for _, cont := range containers {
-				// filter by label
-				if !labelMatches(cont.Labels, c.Docker.LabelFilter) {
-					continue
-				}
-				id := "ctr-" + docker.ShortID(cont.ID)
-				if _, ok := st.Get(id); ok {
-					continue
-				}
-				// allocate mesh ip
-				alloc, _ := mesh.NewAllocator(c.MeshCIDR)
-				// mark existing
-				for _, p := range st.List() {
-					if p.MeshIP != "" {
-						_, _ = alloc.Allocate(p.MeshIP)
-					}
-				}
-				ip, err := alloc.Allocate("")
-				if err != nil {
-					continue
-				}
-				peer := store.Peer{
-					ID:         id,
-					Name:       cont.Names,
-					PublicKey:  cont.Labels["cerberus.public-key"],
-					Endpoint:   "",
-					MeshIP:     ip,
-					AllowedIPs: []string{ip + "/32"},
-					Container:  cont.ID,
-					Labels:     cont.Labels,
-					LastSeen:   docker.Now(),
-				}
-				_ = st.Add(peer)
-				changed = true
-			}
-			if changed {
-				_ = st.Save()
-			}
+	if port, _ := cmd.Flags().GetInt("port"); port > 0 {
+		c.ListenAddr = fmt.Sprintf("0.0.0.0:%d", port)
+		if udpPort, _ := cmd.Flags().GetInt("udp-port"); udpPort == 0 {
+			c.UDPPort = port
 		}
 	}
-}
-
-func labelMatches(labels map[string]string, filter string) bool {
-	if filter == "" {
-		return true
+	if listen, _ := cmd.Flags().GetString("listen"); listen != "" {
+		c.ListenAddr = listen
 	}
-	// filter like key=value or key
-	for _, f := range splitFilters(filter) {
-		f = strings.TrimSpace(f)
-		if f == "" {
-			continue
-		}
-		if strings.Contains(f, "=") {
-			parts := strings.SplitN(f, "=", 2)
-			if labels[parts[0]] != parts[1] {
-				return false
-			}
-		} else {
-			if _, ok := labels[f]; !ok {
-				return false
-			}
-		}
+	if udpPort, _ := cmd.Flags().GetInt("udp-port"); udpPort > 0 {
+		c.UDPPort = udpPort
 	}
-	return true
-}
-
-func splitFilters(s string) []string {
-	// support comma or space
-	s = strings.ReplaceAll(s, " ", ",")
-	return strings.Split(s, ",")
-}
-
-func syncLoop(ctx context.Context, c *config.Config, st *store.Store) {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			for _, p := range c.Peers {
-				base := p
-				if !strings.HasPrefix(base, "http") {
-					base = "http://" + base
-				}
-				client := control.NewClient(base)
-				peers, err := client.ListPeers()
-				if err != nil {
-					continue
-				}
-				changed := false
-				for _, rp := range peers {
-					if rp.ID == "" {
-						continue
-					}
-					// avoid overwriting local
-					if existing, ok := st.Get(rp.ID); ok {
-						if existing.Container != "" {
-							continue
-						}
-					}
-					if err := st.Add(rp); err != nil {
-						continue
-					}
-					changed = true
-				}
-				_ = changed
-			}
-			_ = st.Save()
-		}
+	if cidr, _ := cmd.Flags().GetString("cidr"); cidr != "" {
+		c.MeshCIDR = cidr
 	}
-}
-
-func reconcileLoop(ctx context.Context, c *config.Config, st *store.Store, iso *isolation.Manager, tun *tunnel.Tunnel) {
-	reconcile(c, st, iso, tun)
-	ticker := time.NewTicker(20 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			reconcile(c, st, iso, tun)
-		}
+	if name, _ := cmd.Flags().GetString("name"); name != "" {
+		c.NodeName = name
 	}
-}
-
-func reconcile(c *config.Config, st *store.Store, iso *isolation.Manager, tun *tunnel.Tunnel) {
-	peers := st.List()
-	// build tunnel peers
-	var tunPeers []tunnel.PeerConfig
-	idx := uint32(0)
-	for _, p := range peers {
-		if p.PublicKey == "" {
-			continue
-		}
-		idx++
-		tunPeers = append(tunPeers, tunnel.PeerConfig{
-			Index:     idx,
-			PublicKey: p.PublicKey,
-			Endpoint:  p.Endpoint,
-			MeshIP:    p.MeshIP,
-		})
+	if iface, _ := cmd.Flags().GetString("iface"); iface != "" {
+		c.Interface = iface
 	}
-	if tun != nil {
-		tun.UpdatePeers(tunPeers)
+	if tok, _ := cmd.Flags().GetString("token"); tok != "" {
+		c.AuthToken = tok
 	}
-
-	// isolation
-	if c.Isolation.Enabled && isolation.HasIptables() {
-		ips := []string{}
-		for _, p := range peers {
-			if p.MeshIP != "" {
-				ips = append(ips, p.MeshIP)
-			}
+	if genTok, _ := cmd.Flags().GetBool("gen-token"); genTok && c.AuthToken == "" {
+		tok, err := tunnel.GenerateRandomToken(16)
+		if err != nil {
+			return err
 		}
-		allowed := map[string]map[string]bool{}
-		if c.Isolation.AllowedPeers != nil {
-			// allowed peer names -> mesh ip lookup
-			nameToIP := map[string]string{}
-			for _, p := range peers {
-				nameToIP[p.Name] = p.MeshIP
-				nameToIP[p.ID] = p.MeshIP
-			}
-			for _, src := range c.Isolation.AllowedPeers {
-				_ = src
-				// format src->dst? We'll support "src,dst"
-			}
-		}
-		// blocked peers
-		blocked := map[string]bool{}
-		for _, b := range c.Isolation.BlockedPeers {
-			blocked[b] = true
-		}
-		// build allowed matrix from blocked list: all pairs allowed except blocked
-		for i, src := range ips {
-			allowed[src] = map[string]bool{}
-			for j, dst := range ips {
-				if i == j {
-					continue
-				}
-				ok := true
-				// if src or dst in blocked list (by ip or name), block
-				for name := range blocked {
-					if name == src || name == dst {
-						ok = false
-					}
-				}
-				if ok {
-					allowed[src][dst] = true
-				}
-			}
-		}
-		_ = iso.ApplyPolicy(ips, allowed, c.Isolation.DefaultDeny)
+		c.AuthToken = tok
 	}
-}
+	if cmd.Flags().Changed("default-deny") {
+		dd, _ := cmd.Flags().GetBool("default-deny")
+		c.Isolation.Enabled = true
+		c.Isolation.DefaultDeny = dd
+	}
+	if cmd.Flags().Changed("userspace") {
+		us, _ := cmd.Flags().GetBool("userspace")
+		c.UserspaceOnly = us
+	}
+	forceTCP, _ := cmd.Flags().GetBool("tcp-only")
 
-func firstIP(c *config.Config) string {
-	_, n, err := net.ParseCIDR(c.MeshCIDR)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cfgPath := cfgPathOrDefault()
+	srv, err := node.StartServer(ctx, node.ServerOptions{
+		Config:     c,
+		ConfigPath: cfgPath,
+		ForceTCP:   forceTCP,
+	})
 	if err != nil {
-		return "10.77.0.1"
+		return err
 	}
-	ip := make(net.IP, len(n.IP))
-	copy(ip, n.IP)
-	// +1
-	for i := len(ip) - 1; i >= 0; i-- {
-		ip[i]++
-		if ip[i] != 0 {
-			break
-		}
+	defer srv.Stop()
+	_ = c.Save(cfgPath)
+
+	_, portStr, _ := net.SplitHostPort(srv.ListenAddr())
+	displayHost := firstNonLoopbackIPv4(srv.Tunnel.InterfaceName())
+	if displayHost == "" {
+		displayHost = "<SERVER_IP>"
 	}
-	return ip.String()
+	joinTarget := net.JoinHostPort(displayHost, portStr)
+	if portStr == "" {
+		joinTarget = displayHost + ":" + strconv.Itoa(srv.UDPPort())
+	}
+
+	tunMode := "userspace"
+	if srv.Tunnel.HasOSInterface() {
+		tunMode = fmt.Sprintf("kernel tun (%s)", srv.Tunnel.InterfaceName())
+	}
+
+	fmt.Println("Cerberus Smart Server running")
+	fmt.Printf("  node:         %s\n", c.NodeName)
+	fmt.Printf("  mesh gateway: %s (%s)\n", srv.MeshIP(), c.MeshCIDR)
+	fmt.Printf("  control/tcp:  %s\n", srv.ListenAddr())
+	fmt.Printf("  wireguard/udp:0.0.0.0:%d\n", srv.UDPPort())
+	fmt.Printf("  tunnel mode:  %s\n", tunMode)
+	fmt.Printf("  public key:   %s\n", c.PublicKey)
+	if c.AuthToken != "" {
+		fmt.Printf("\nJoin from any client (zero setup — auto keys + IP):\n")
+		fmt.Printf("  cerberus client %s --token %s\n\n", joinTarget, c.AuthToken)
+	} else {
+		fmt.Printf("\nJoin from any client (zero setup — auto keys + IP):\n")
+		fmt.Printf("  cerberus client %s\n\n", joinTarget)
+	}
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case <-sigCh:
+	case <-ctx.Done():
+	}
+	fmt.Println("shutting down cerberus server")
+	return nil
+}
+
+func init() {
+	bindServerFlags(serverCmd)
+	bindServerFlags(daemonCmd)
 }

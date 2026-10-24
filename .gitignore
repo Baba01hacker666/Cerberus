@@ -1,0 +1,5 @@
+/cerberus
+/dist/
+*.test
+*.out
+.DS_Store
